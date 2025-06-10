@@ -1,5 +1,3 @@
-# VisioAssist
-
 # VisioAssist 🎙️👁️  
 **A Raspberry Pi-based Voice Assistant for the Visually Impaired**
 
