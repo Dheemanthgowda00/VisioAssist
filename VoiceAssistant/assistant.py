@@ -37,13 +37,10 @@ CONTACTS = {
     "deepak": "+918867398549"
 }
 
-
-
 # Load OpenRouter API key from .env
 load_dotenv()
 api_key = os.getenv("OPENROUTER_API_KEY")
 weather_api_key = os.getenv("WEATHER_API_KEY")
-
 
 # === User Data Handling ===
 USER_DATA_FILE = "user_data.json"

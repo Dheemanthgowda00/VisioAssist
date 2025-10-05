@@ -230,7 +230,7 @@ if __name__ == "__main__":
     
     try:
         # Start the Flask web server
-        app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+        app.run(host='0.0.0.0', port=5003, debug=True, use_reloader=False)
     except KeyboardInterrupt:
         print("\n🛑 Server stopped manually.")
     except Exception as e:
