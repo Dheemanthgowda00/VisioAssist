@@ -1,26 +1,22 @@
+# /home/raspberry/VISIOASSIST/COMPUTERVISION/ocr_reader.py
+
 import os
 import sys
 import time
-import threading
 import cv2
-# Import Gemini components for the background task
 import google.generativeai as genai
-from PIL import Image
-from dotenv import load_dotenv 
-from flask import Flask, Response, render_template_string
-from picamera2 import Picamera2
 import numpy as np
+from PIL import Image
+from dotenv import load_dotenv
+from picamera2 import Picamera2
+import sounddevice as sd
+from piper.voice import PiperVoice 
 
-# Load environment variables (for GOOGLE_API_KEY)
+# Load environment variables
 load_dotenv()
 
-# --- Global State and Configuration ---
+# --- Configuration ---
 
-latest_ocr_text = "Awaiting first Gemini OCR scan..."
-ocr_lock = threading.Lock() 
-
-# --- Gemini API Configuration ---
-# We will use the fast model for this type of repeated vision task
 MODEL_NAME = 'gemini-2.5-flash' 
 # Instruction prompt to make Gemini act as an OCR system
 GEMINI_OCR_PROMPT = (
@@ -28,22 +24,23 @@ GEMINI_OCR_PROMPT = (
     "If no clear text is visible, respond ONLY with 'No readable text was detected.'"
 )
 
-# Camera configuration
+# Camera Configuration
 CAMERA_WIDTH, CAMERA_HEIGHT = 640, 480
 FRAME_INTERVAL = 4 # seconds between API calls
 
+# --- Initialization: API, Camera, and Voice ---
+
+# Load API key and configure Gemini
 try:
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        raise ValueError("GOOGLE_API_KEY not found in .env file or environment variables.")
+        raise ValueError("GOOGLE_API_KEY not found.")
     genai.configure(api_key=api_key)
-except ValueError as e:
-    print(f"Error: {e}")
+except Exception as e:
+    print(f"Error initializing Gemini: {e}")
     sys.exit(1)
 
-
-# --- Picamera2 Setup ---
-
+# Picamera2 Setup
 try:
     picam2 = Picamera2()
     video_config = picam2.create_video_configuration(
@@ -51,193 +48,93 @@ try:
     )
     picam2.configure(video_config)
     picam2.start()
-    time.sleep(2)
-    print("🚀 Picamera2 initialized.")
+    time.sleep(1)
+    print("🚀 Picamera2 initialized for OCR.")
 except Exception as e:
     print(f"Error initializing Picamera2: {e}")
     sys.exit(1)
 
+# Piper Voice-Over Setup
+try:
+    voice = PiperVoice.load("/home/raspberry/VISIOASSIST/VoiceAssistant/assistant/models/piper/en_US-lessac-medium.onnx") 
+    print("🎤 Piper voice model loaded successfully.")
+except Exception as e:
+    print(f"FATAL ERROR: Could not load Piper voice model: {e}")
+    sys.exit(1)
 
-# --- Background OCR Worker (Gemini Integration) ---
+# --- Functions ---
 
-class BackgroundTaskManager(threading.Thread):
-    def __init__(self):
-        super().__init__()
-        self.daemon = True
-        self.running = True
+def speak_description(text):
+    """Converts text to speech using the Piper voice model and plays it."""
+    if not text or text.startswith("Error:"):
+        return
 
-    def run(self):
-        global latest_ocr_text
-        print("🤖 Gemini OCR Background Task started.")
-        while self.running:
-            try:
-                # 1. Capture a frame
-                frame = picam2.capture_array()
-                
-                # 2. Convert OpenCV BGR frame to PIL Image (RGB) for Gemini
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(rgb_frame)
+    try:
+        audio_chunks = voice.synthesize(text)
+        audio_bytes = b"".join(chunk.audio_int16_bytes for chunk in audio_chunks)
+        audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+        sd.play(audio_array, samplerate=16000) 
+        sd.wait()
+        print(f"🗣️ Spoke: {text}")
+    except Exception as e:
+        print(f"TTS Playback Error: {e}")
 
-                # 3. Call the Gemini API
-                model = genai.GenerativeModel(MODEL_NAME)
-                response = model.generate_content([GEMINI_OCR_PROMPT, img])
+def describe_scene_from_frame(frame, prompt: str) -> str:
+    """Generates a description/transcription using Gemini Vision model."""
+    try:
+        # BGR to RGB conversion for PIL/Gemini.
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb_frame)
 
-                # 4. Process response
-                extracted_text = response.text.strip()
-                
-                if not extracted_text or "no readable text was detected" in extracted_text.lower():
-                    extracted_text = "No readable text was detected."
-                else:
-                    # Clean up newlines and extra spaces for display
-                    extracted_text = " ".join(extracted_text.split())
+        model = genai.GenerativeModel(MODEL_NAME) 
+        response = model.generate_content([prompt, img])
 
-                # 5. Update global state safely
-                with ocr_lock:
-                    latest_ocr_text = extracted_text
-                    print(f"🔍 OCR Result: {extracted_text[:60]}...")
+        if response.text:
+            # Clean up newlines and extra spaces for display and speech
+            return " ".join(response.text.strip().split())
+        else:
+            return "No text response from model."
 
-            except Exception as e:
-                error_msg = f"API Error: Check quota/model access: {e}"
-                print(f"⚠️ {error_msg}")
-                with ocr_lock:
-                    latest_ocr_text = error_msg
-            
-            # Wait for the next interval
-            time.sleep(FRAME_INTERVAL)
-
-    def stop(self):
-        self.running = False
+    except Exception as e:
+        return f"Error: API call failed: {e}"
 
 
-# --- Flask Streaming Logic ---
-
-app = Flask(__name__)
-
-def gen_frames():
-    """Generates the Motion JPEG stream from the camera."""
-    while True:
-        # 1. Capture frame
-        frame = picam2.capture_array()
-        
-        # 2. Get the latest OCR text for overlay
-        with ocr_lock:
-            current_ocr_text = latest_ocr_text
-            
-        # 3. Add OCR text overlay to the frame
-        overlay_text = f"OCR: {current_ocr_text[:50]}..."
-        cv2.putText(frame, overlay_text, (10, CAMERA_HEIGHT - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2) # Yellow color for text
-        
-        # 4. **COLOR CORRECTION & ENCODE:** Convert BGR -> RGB for web display
-        frame_rgb_display = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        ret, buffer = cv2.imencode('.jpg', frame_rgb_display)
-        frame_bytes = buffer.tobytes()
-
-        # 5. Yield the frame in MJPEG format
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        
-        # Stream speed control
-        time.sleep(0.01)
-
-
-# --- Flask Application Setup (HTML and Routing) ---
-
-HTML_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Pi Gemini OCR Stream</title>
-    <style>
-        body { text-align: center; font-family: Arial, sans-serif; background-color: #1a1a1a; color: #f0f0f0; }
-        h1 { color: #00bcd4; margin-bottom: 20px; }
-        .container { display: flex; justify-content: center; align-items: flex-start; gap: 40px; margin-top: 20px;}
-        .description-box { 
-            width: 350px; 
-            padding: 20px; 
-            border: 2px solid #00bcd4; 
-            border-radius: 12px; 
-            text-align: left; 
-            background-color: #2c2c2c; 
-            box-shadow: 0 4px 15px rgba(0, 188, 212, 0.3);
-        }
-        .description-box h2 { margin-top: 0; color: #ffeb3b; font-size: 1.4em; }
-        .description-box p { font-size: 1.1em; word-wrap: break-word; }
-        img { border: 4px solid #444; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.5); }
-    </style>
-</head>
-<body>
-    <h1>Live Raspberry Pi Gemini OCR Scanner</h1>
-    <div class="container">
-        <img src="{{ url_for('video_feed') }}" width="{{ cam_w }}" height="{{ cam_h }}">
-        <div class="description-box">
-            <h2>Latest Recognized Text:</h2>
-            <p id="description">{{ current_description }}</p>
-            <p style="font-size: 0.9em; color: #999;">Scanning frequency: {{ frame_interval }} seconds.</p>
-        </div>
-    </div>
-    <script>
-        function updateDescription() {
-            fetch('/text_feed')
-                .then(response => response.text())
-                .then(text => {
-                    document.getElementById('description').innerText = text;
-                })
-                .catch(error => {
-                    document.getElementById('description').innerText = 'Connection Error.';
-                });
-        }
-        setInterval(updateDescription, 1000); 
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    """Renders the main web page."""
-    with ocr_lock:
-        current_description = latest_ocr_text
-
-    return render_template_string(HTML_PAGE, 
-                                  current_description=current_description,
-                                  frame_interval=FRAME_INTERVAL,
-                                  cam_w=CAMERA_WIDTH,
-                                  cam_h=CAMERA_HEIGHT)
-
-@app.route('/video_feed')
-def video_feed():
-    """Route to serve the streaming video (MJPEG)."""
-    return Response(gen_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/text_feed')
-def text_feed():
-    """Simple route to provide the latest OCR description as plain text."""
-    with ocr_lock:
-        return latest_ocr_text
-
-
-# --- Script Execution ---
+# --- Main Execution Loop ---
 
 if __name__ == "__main__":
-    # Start the OCR worker thread
-    ocr_manager = BackgroundTaskManager()
-    ocr_manager.start()
-
-    print(f"PiCamera is running. Access the web stream at http://<Your_Pi_IP_Address>:5000")
-    print(f"Gemini API will be called every {FRAME_INTERVAL} seconds.")
+    
+    speak_description("Continuous reading mode activated.")
+    
+    # We will use this flag and the timer in the main assistant to control duration.
+    previous_text = "initial state" 
     
     try:
-        # Start the Flask web server
-        app.run(host='0.0.0.0', port=5003, debug=True, use_reloader=False)
-    except KeyboardInterrupt:
-        print("\n🛑 Server stopped manually.")
+        while True:
+            # 1. Capture frame
+            frame = picam2.capture_array()
+            
+            # 2. Get description
+            current_text = describe_scene_from_frame(frame, GEMINI_OCR_PROMPT)
+            
+            print(f"--- OCR Result: {current_text}")
+            
+            # 3. Speak only if the text has changed and is not a default/error message
+            if (current_text.lower() != previous_text.lower() and 
+                "no readable text was detected" not in current_text.lower() and
+                "error:" not in current_text.lower()):
+                
+                speak_description(f"I read: {current_text}")
+                previous_text = current_text
+            
+            # 4. Wait for the interval before the next scan
+            time.sleep(FRAME_INTERVAL)
+                
     except Exception as e:
-        print(f"\nAn error occurred: {e}")
+        print(f"An error occurred during the main OCR loop: {e}")
+        # The main assistant will kill this process, so we don't need a clean exit speak.
+        
     finally:
-        # Ensure the background thread and camera are stopped cleanly
-        ocr_manager.stop()
-        ocr_manager.join()
+        # Clean up resources
         picam2.stop()
-        print("📷 Camera and Gemini OCR manager released.")
+        print("📷 Camera released. OCR reader script finished.")
+        sys.exit(0)

@@ -1,6 +1,7 @@
 {
-    "name": "Dheemanth",
-    "workplace": "Robomanthan",
-    "bank_password": "1234",
-    "bank_pin": "1234"
+    "reminders": [],
+    "memory": {
+        "birthday": "30th october",
+        "workplace": "robo man"
+    }
 }
